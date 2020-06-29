@@ -29,16 +29,30 @@ def read_data(file_path):
                 'ik' : list(range(len(items)))})
     d = pd.merge(d, item_df, how='left', on='itemkey')
     
+    person_df = d[['id', 'sid', 'th_0']]
+
+    person_df.to_csv('output/person_key.csv')
+    item_df.to_csv('output/item_key.csv')
+    
     return d
 
 def init_params(d):
-    pass
-
     n_items = d['ik'].nunique()
     n_persons = d['sid'].nunique()
 
     theta = np.broadcast_to([0, 20, 0], [n_persons, 3])
     beta = np.zeros([n_items, 4])
+
+    X = d[['resp', 'sid', 'ik', 'seq', 'lrt', 'p']].to_numpy(copy=True)
+
+    return X, theta, beta
+
+def init_1m_1pl_params(d):
+    n_items = d['ik'].nunique()
+    n_persons = d['sid'].nunique()
+
+    theta = np.broadcast_to([0, 20], [n_persons, 2])
+    beta = np.zeros([n_items, 2])
 
     X = d[['resp', 'sid', 'ik', 'seq', 'lrt', 'p']].to_numpy(copy=True)
 

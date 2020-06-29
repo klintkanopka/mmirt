@@ -1,0 +1,122 @@
+---
+title: "IRT Mixture Modeling with NWEA MAP"
+author: "Klint Kanopka"
+date: "4/22/2020"
+output: 
+  pdf_document:
+    number_section: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(RColorBrewer)
+library(stargazer)
+
+setwd('~/projects/mmirt/')
+
+ll <- read_csv('output/mix-1-eps-7/1m_1pl_loglik.csv') %>% 
+  mutate(iteration = row_number()-1)
+beta <- read_csv('output/mix-1-eps-7/1m_1pl_beta.csv')
+theta <- read_csv('output/mix-1-eps-7/1m_1pl_theta.csv')
+
+pk <- read_csv('output/mix-1-eps-7/person_key.csv')
+ik <- read_csv('output/mix-1-eps-7/item_key.csv')
+```
+
+# Model Specification
+
+The model fit was:
+
+$$P(X_{ij} = 1 | \theta_i, b_{je}, b_{jl}, \pi_{ij}) = \pi_{ij} \sigma \big(\theta_i - b_{je}\big) + (1 - \pi_{ij}) \sigma \big(\theta_i - b_{jl} \big)$$
+Where:
+- $\theta_i$ is student $i$'s latent ability
+- $b_{je}$ is item $j$'s difficulty when encountered early in the test
+- $b_{jl}$ is item $j$'s difficulty when encountered late in the test
+- $\sigma$ is the standard logistic sigmoid function, specified by:
+$$\sigma(z) = \frac{1}{1+e^{-z}}$$
+- $\pi_{ij}$ is a mixing parameter for the $i$th student's exposure to item $j$. This parameter is specified as a function of sequence number:
+$$\pi_{ij} = \sigma \bigg( \frac{k_i - s_j}{c} \bigg)$$
+where $s_{ij}$ is the *sequence number*, or the position in the test sequence where student $i$ saw item $j$, $k_i$ is a learned parameter that corresponds to the sequence number where student $i$'s item response function is a 50/50 mixture of early and late test behavior, and $c$ is a scale parameter that is fixed across all students. For this analysis, the scale parameter was fixed to $c=10$.
+
+
+## Data
+
+Data is taken from a spring administration of the NWEA MAP assessment. It consists of 7256 individual items taken by 464,117 individual students across multiple grades. Each student sees, on average, 39 different items, resulting in 18,187,294 observed item responses.
+
+## Fitting
+
+The model was fit in Python (3.6.9) primarily using NumPy (1.17.4), optimized using joint maximum likelihood estimation and (full batch) gradient ascent. A plot of average log likelihood after each gradient ascent update is shown below. Note that a convergence threshold of $\varepsilon = 10^{-5}$ was used. From this, we observe that a smaller value of $\varepsilon$ could be used in the future.
+
+```{r loglik}
+ggplot(ll, aes(x = iteration, y = loglikelihood)) +
+  geom_line(color='cornflowerblue') + 
+  labs(x = 'Iteration', y = 'Average Log Likelihood') +
+  theme_bw()
+```
+
+# Initial Descriptives
+
+## Persons
+
+First we look to see there is a relationship between the estimated abilities $(\theta_i)$ and how late early sequence behavior persists in students $k_i$. The figure below shows $\theta$ vs. $k$, with a linear fit superimposed. We first note that the range of estimate $k$ values is small. This could be an artifact of the choice of $c$ or $\varepsilon$. Either way, we notice that there is modest positive association - students of higher estimated ability also tend to have higher estimated $k$ parameters. Note that a more flexible (GAM) smoother also showed a similar relationship.
+
+```{r}
+ggplot(theta, aes(x = k, y = theta)) + 
+  geom_point(alpha = 0.05) + 
+  labs(x = 'k', y = 'Theta') +
+  geom_smooth(method="lm", color='cornflowerblue', se=F) +
+  theme_bw()
+```
+
+Next we regress $\theta$ on $k$ find the relationship significant:
+
+```{r, results='asis'}
+m = lm(theta ~ k, theta)
+stargazer(m, header = F)
+```
+
+
+## Items
+
+When examining items, we first look at the distribution of estimated early and late test difficulties:
+
+```{r}
+ggplot(beta) + 
+  geom_density(aes(x=b0, fill='b_e'), alpha = 0.5) +
+  geom_density(aes(x=b1, fill='b_l'), alpha = 0.5) +
+  labs(y = 'Density', x = 'Parameter Value') +
+  scale_fill_manual(name = 'Difficulty', values = c('b_e' = 'cornflowerblue', 'b_l' = 'indianred')) +
+  theme_bw()
+```
+
+Strangely, we observe that late test difficulties appear to be lower than early test difficulties. Next we look at the relationship between estimated early test difficulties and estimated late test difficulties by item. A dashed line is overlaid to guide the eye and show where $b_{je}=b_{jl}$.
+
+```{r}
+ggplot(beta, aes(x = b0, y = b1)) + 
+  geom_point(alpha = 0.2) + 
+  labs(x = 'Early Test Difficulty', y = 'Late Test Difficulty') +
+  geom_abline(aes(slope=1, intercept=0), color='cornflowerblue', lty=2) + 
+  theme_bw()
+```
+
+Here we see items seem to come from two distinct distributions. The first, just above the dashed line, are items that are slightly harder when they come later in the test. The second, below the dashed line, is items that are much easier when they occur later in the test.
+
+Next we look at the magnitude of the difference between late and early test difficulty by item. First, we observe that the proportion of items estimated to be harder later in the test is `r round(mean(beta[2] > beta[1]), 3)`. Next we look at the distribution of differences in difficulty and see, as expected from the previous plot, that items that get harder only get modestly harder, while items that get easier can get much easier:
+
+```{r}
+
+ggplot(beta, aes(x = b1-b0)) +
+  geom_density(color="black", fill="cornflowerblue", alpha=0.9) +
+  labs(x = 'Difference between late and early difficulty',
+       y = 'Density') +
+  theme_bw()
+```
+
+# Next Steps
+
+- Reduce the value of $\varepsilon$. This is currently running.
+- Experiment with different values of $c$. Is there enough data to learn a per-person $c$ value (I don't think so)?
+- Relate MMIRT estimated $\theta, k, b_e, b_l$ parameters to NWEA estimated $\theta, b$ parameters.
+- Dig deeper into the estimated item parameters. Is there something about typical sequence position (are these pilot items?) or number of exposures that can account for the differences in estimated difficulties?
+- The idea of modeling sequence number is meant to uncover information about different response processes students may be using. We also have response time data - how can that be included in this framework?

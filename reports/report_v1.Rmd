@@ -1,0 +1,291 @@
+---
+title: "Uncovering Order Effects with an IRT Mixture Model"
+author: "Klint Kanopka"
+date: "4/22/2020"
+output: 
+  pdf_document:
+    number_section: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(stargazer)
+setwd('~/projects/mmirt/')
+
+ll <- read_csv('output/mix-1-eps-7/1m_1pl_loglik.csv') %>% 
+  mutate(iteration = row_number()-1)
+beta <- read_csv('output/mix-1-eps-7/1m_1pl_beta.csv')
+theta <- read_csv('output/mix-1-eps-7/1m_1pl_theta.csv')
+
+pk <- read_csv('output/mix-1-eps-7/person_key.csv') %>% 
+  select(-X1) %>% 
+  distinct()
+ik <- read_csv('output/mix-1-eps-7/item_key.csv') %>% 
+  select(-X1)
+
+full <- read_csv('data/allgrade_Spring_6.csv')
+
+standardize <- function(x){
+  (x - mean(x, na.rm=TRUE)) / sd(x, na.rm=TRUE)
+}
+
+# add linking indices
+theta$sid <- 0:(nrow(theta)-1)
+beta$ik <- 0:(nrow(beta)-1)
+```
+
+# Introduction
+
+Previous work has found that for the NWEA MAP assessment, there are differences in both response accuracy and response speed that evolve over the course of the test. This work uses an IRT mixture model to identify changes in the item response function (IRF) over the course of the test. 
+
+The mixture model proposed below requires a three fundamental assumptions:
+
+1. Each item has two difficulties associated with it, one when encountered early in the test and one when encountered late in the test.
+2. An individual's probability of correct response depends on three quantities: the difference between their latent ability and the early test difficulty, the difference between their latent ability and the late test difficulty, and the difference between a person-specific "endurance" parameter and the location of the item in the test.
+3. The mixture of early and late test contributions is a monotonic function of item location such that as items appear later on the test, their late test parameter contribution is higher.
+
+# Model
+
+The model fit is a straightforward mixture of two Rasch IRFs:
+
+$$P(X_{ij} = 1 | \theta_i, b_{je}, b_{jl}, \pi_{ij}) = \pi_{ij} \sigma \big(\theta_i - b_{je}\big) + (1 - \pi_{ij}) \sigma \big(\theta_i - b_{jl} \big)$$
+Where:
+
+- $\theta_i$ is student $i$'s latent ability
+- $b_{je}$ is item $j$'s difficulty when encountered early in the test
+- $b_{jl}$ is item $j$'s difficulty when encountered late in the test
+- $\sigma$ is the standard logistic sigmoid function, specified by:
+$$\sigma(z) = \frac{1}{1+e^{-z}}$$
+- $\pi_{ij}$ is a mixing parameter for the $i$th student's exposure to item $j$. This parameter is specified as a function of sequence number:
+$$\pi_{ij} = \sigma \bigg( \frac{k_i - s_{ij}}{c} \bigg)$$
+where $s_{ij}$ is the *sequence number*, or the position in the test sequence where student $i$ saw item $j$, $k_i$ is the aforementioned "endurance" parameter --- learned parameter that corresponds to the sequence number where student $i$'s item response function is a 50/50 mixture of early and late test behavior, and $c$ is a scale parameter that is fixed across all students. For this analysis, the scale parameter was fixed to $c=10$.
+
+For a respondent with $k_i = 20$, the plot below shows how their $\pi_{ij}$ changes over the course of a 40-item test.
+
+```{r mixing_param, echo=F}
+sigmoid <- function(z) 1/(1+exp(-z))
+x <- seq(from=0, to=40, by=0.1)
+y <- sigmoid((20-x)/10)
+
+data.frame(s = x, pi = y) %>% 
+  ggplot(aes(x=s, y=pi)) +
+  geom_line(color='darkgreen') + 
+  labs(x = 'Sequence number', y='Proportion of early-test IRF',
+       title='Mixing parameter \\pi_ij over the course of the test when k_i = 20') +
+  theme_bw()
+
+```
+
+Note that different values of $k_i$ will change where this curve hits 0.5, but the slope is fixed across respondents.
+
+# Results
+
+## Person-side
+
+```{r person_data, echo=F}
+p <- full %>% 
+  group_by(id) %>% 
+  filter(sequence_number == max(sequence_number)) %>% 
+  ungroup() %>% 
+  select(id, nwea_theta = th) %>% 
+  distinct()
+  
+p_2 <- full %>% 
+  distinct() %>% 
+  group_by(itemkey) %>% 
+  mutate(lrt = standardize(lrt)) %>% 
+  ungroup() %>% 
+  group_by(id) %>% 
+  summarize(p_correct = mean(resp),
+            mean_lrt = mean(lrt),
+            sd_lrt = sd(lrt),
+            n_items = n(),
+            .groups='drop')
+
+p <- p %>% 
+  inner_join(p_2, by='id') %>% 
+  inner_join(pk, by='id') %>% 
+  inner_join(theta, by='sid')
+```
+
+### Comparing ability estimates
+
+We see that the $\theta$ values estimated from the mixture model are well correlated with the $\theta$s estimated by NWEA ($\rho =$ `r round(cor(p$nwea_theta, p$theta),3)`). This is done without using any of the pre-calibrated item information, and estimated from raw item response matrices. 
+
+```{r theta-theta_plot, echo=F}
+ggplot(p, aes(x=nwea_theta, y=theta)) +
+  geom_point(alpha=0.05) +
+  geom_smooth(method=lm, formula=y~x, color='firebrick', se=F) +
+  labs(x='NWEA Theta', y='MMIRT Theta', title='Estimated Thetas are well correlated') +
+  theme_bw()
+```
+
+### The "endurance" parameter, $k$
+
+At the start of training, all of the $k$ parameters are initialized to $k=20$. We see that during training, many students spread away from 20, but not by a wide margin. This is likely due to the use of a fixed scaling constant, $c=10$, for all of the mixing parameter curves. Future work should explore allowing for a more flexible specification of the mixing parameter, though this would involve estimated three parameters per person instead of only two.
+
+```{r k_density, echo=F}
+ggplot(p, aes(x=k)) +
+  geom_histogram(bins=50, fill='firebrick', alpha=0.7) +
+  labs(x='k', y='Frequency', title='Estimated k parameters are all very close to 20') +
+  theme_bw()
+
+```
+
+
+### Relationship between $k$ and $\theta$
+
+Intuitively, one might expect that students who maintain early test behavior further into the test will do better. Plotting a hexbin scatter with a linear fit line over it, we see this to be (weakly) the case. 
+
+```{r k_theta_plot, echo=F}
+ggplot(p, aes(x=k, y=theta)) + 
+  geom_hex(bins=50) +
+  geom_smooth(method=lm, formula=y~x, color='firebrick', se=F) +
+  labs(x='k', y='Theta', title='Theta and k are slightly related') +
+  theme_bw()
+```
+
+Looking at a linear regression of $\theta$ on $k$, we see that $k$ only explains half a percent of the overall variance in $\theta$. One potential confound is that all grades are pooled together - so high performing younger students may have higher $k$ values and similar $\theta$ to lower performing older students. Additionally, with this many observations, any coefficient would likely be significant.
+
+```{r k_theta_regression, echo=F, results='asis'}
+m <- lm(theta~k, data=p)
+
+stargazer(m, header=F)
+```
+
+
+## Item-side
+
+```{r item_data, echo=F}
+i <- full %>% 
+  group_by(itemkey) %>% 
+  summarize(diff = mean(diff),
+            p = mean(resp),
+            n = n(),
+            mean_lrt = mean(lrt),
+            sd_lrt = sd(lrt),
+            mean_seq = mean(sequence_number),
+            sd_seq = sd(sequence_number),
+            .groups='drop')
+
+i <- ik %>% 
+  inner_join(i, by='itemkey') %>% 
+  inner_join(beta, by='ik')
+```
+
+### Comparing difficulties with NWEA
+
+The two plots below compare mixture model estimated early and late test difficulties to the NWEA estimated difficulties. We see that they are generally well correlated in both scenarios, but some mixture model early test difficulties are really high, while there is a chunk of low late test difficulties. We examine the relationship between early and late test difficulty within the mixture model in the next section.
+
+```{r diff_comparison_early, echo=F}
+ggplot(i, aes(x=diff, y=b0)) +
+  geom_hex(bins=50) +
+  labs(x='NWEA Difficulty', y='MMIRT Early Test Difficulty', title='Some early test difficulties are very high') +
+  theme_bw()
+```
+
+```{r diff_comparison_late, echo=F}
+ggplot(i, aes(x=diff, y=b1)) +
+  geom_hex(bins=50) +
+  labs(x='NWEA Difficulty', y='MMIRT Late Test Difficulty', title='Some late test difficulties are low') +
+  theme_bw()
+```
+
+### Changing difficulties
+
+Looking at a hexbin scatter with mixture model early test difficulty on the $x$ axis and late test difficulty on the $y$ axis. A line along $y=x$ has been added to guide the eye. We see that while the bulk of items are, in fact, harder when encountered late in the test, there are two large blobs of items that are estimated to be easier early in the test.
+
+```{r diff_comparison_within, echo=F}
+ggplot(i, aes(x=b0, y=b1)) +
+  geom_hex(bins=50) +
+  geom_abline(aes(intercept=0, slope=1), color='firebrick') +
+  labs(x='MMIRT Early Test Difficulty', y='MMIRT Late Test Difficulty', title='There are some really wonky items') +
+  theme_bw()
+```
+
+One potential explanation for this could have to do with the relative frequency of individual items.
+
+```{r item_frequency, echo=F}
+ggplot(i, aes(x=n)) + 
+    geom_histogram(bins=50, fill='firebrick', alpha=0.7) +
+  labs(x='Item Frequency', y='Frequency', title='There are some really rare items') +
+  theme_bw()
+```
+
+When we color the earlier plot based upon item frequency, we see that items that occur fewer than 500 times account for almost all of the "wonky" items that appear easier in the beginning than they are later.
+
+```{r diff_comparison_by_n, echo=F}
+ggplot(i, aes(x=b0, y=b1, color=ifelse(n>500, 'n > 500', 'n <= 500'))) +
+  geom_point(alpha=0.25) +
+  scale_color_manual(name='Item Frequency', values=c('n > 500' = 'black', 'n <= 500' = 'firebrick')) +
+  labs(x='MMIRT Early Test Difficulty', y='MMIRT Late Test Difficulty', title='The wonky items tend to be rare') +
+  theme_bw()
+```
+
+Looking at a histogram of the difference between late test difficulty and early test difficulty, we see that most items do appear harder later in the test.
+
+```{r delta_hist, echo=F}
+ggplot(i, aes(x=b1-b0)) + 
+    geom_histogram(bins=50, fill='firebrick', alpha=0.7) +
+  labs(x='Difference between early and late difficulty', y='Frequency', title='Most items are harder later') +
+  theme_bw()
+```
+
+Additionally, we confirm with a different plot that those items that are harder earlier are, in fact rare. Many of these items appear only a single time in the dataset.
+
+```{r delta_n, echo=F}
+ggplot(i, aes(x=b1-b0, y=n)) + 
+    geom_hex(bins=50) +
+  labs(x='Difference between early and late difficulty', y='Item Frequency', title='Items that appear harder earlier occur rarely') +
+  theme_bw()
+```
+
+We can also look at the mean sequence position vs the difference between late and early test difficulty. Here we see that many of the items with the largest magnitude differences between early and late test difficulty may only appear at the beginning or end of the test. If all respondents (or, in some cases, they only respondent) answer those items correctly or incorrectly, maximum likelihood estimation will be able to see gains by pushing the item parameters farther and farther apart. This is a potential limitation of the model. For items that tend to appear anywhere and have a large number of responses, parameter estimation seems to reflect intuition.
+
+```{r delta_seq, echo=F}
+ggplot(i, aes(x=b1-b0, y=mean_seq)) + 
+    geom_hex(bins=50) +
+  labs(x='Difference between early and late difficulty', y='Mean Item Position', title='Many items only occur in specific positions') +
+  theme_bw()
+```
+
+### Effective IRF
+
+Among items occurring $n>500$ times, the median difference between early and late test difficulty is $\delta =$ `r round(median(i$b1[i$n>500] - i$b0[i$n>500]))`. Next we visualize how the item response function changes as a function of sequence position for a hypothetical item with early test difficulty $b_0 = 0$ and this $\delta$ ($b_1 =$ `r round(median(i$b1[i$n>500] - i$b0[i$n>500]))`). We see that for a respondent with $\theta = 0$ and $k=20$, the probability of correct response when the item is first is $p=0.487$. When the item is approximately last ($s=40$), the response probability drops to $p=0.412$ --- a decrease of 0.075. For some items, the magnitude of this position effect is larger, and for others it is smaller.  
+
+```{r effective_irf, echo=F}
+sigmoid <- function(z) 1 / (1 + exp(-z))
+mix_param <- function(s) sigmoid( (20-s)/10)
+
+th <- seq(from=-5, to=5, by=0.01)
+
+b0 <- 0
+b1 <- b0 + median(i$b1[i$n>500] - i$b0[i$n>500])
+
+irf_0 <- sigmoid(th - b0)
+irf_1 <- sigmoid(th - b1)
+
+d <- data.frame(theta = th,
+                item_1 = mix_param(1) * irf_0 + (1 - mix_param(1)) * irf_1,
+                item_20 = mix_param(20) * irf_0 + (1 - mix_param(20)) * irf_1,
+                item_40 = mix_param(40) * irf_0 + (1 - mix_param(40)) * irf_1) %>% 
+  pivot_longer(-theta, names_to='Item Position', values_to = 'p')
+
+ggplot(d, aes(x = theta, y=p, color=`Item Position`)) +
+  geom_line() +
+  labs(x='Theta', y='Probability of Correct Response') +
+  theme_bw()
+```
+
+
+# Conclusions
+
+Within the NWEA MAP assessment, using a mixture model efficiently estimates item position effects by including only a single additional parameter per item. Additionally, the general specification is agnostic to the choice of item response function and allows for flexible specification (for example, using a 2PL and estimating a single discrimination per item, but early/late difficulties). This method appears work well assuming that there is a sufficient number of responses to each item and sufficient variability in observed item position.
+
+Additionally, this model allows for estimating person parameters that allow for individuals to progress from "relatively early" interactions to "relatively late" interactions at different rates. 
+
+Because the thetas and item difficulties estimated are reasonably well aligned with NWEA's estimates (despite being reported on a wildly different scale), I have confidence that the model hasn't fully gone off the rails and is estimating meaningful parameters. Additionally, because there is evidence the items are subject to position effects of relatively large magnitude, I suspect there may be some (as yet unquantified) problem with the NWEA student ability estimates.
+
+That said, this method does have limitations. First, items need to appear in a wide variety of positions. Second, items that have only a few responses will have outlandish parameter estimates. Third, because of the way that the scaling constant, $c$ is used in the mixing parameter $\pi_{ij}$, the person-side "endurance" parameter $k$ is not particularly informative. Future work to improve the model should allow for a more flexible specification of $\pi_{ij}$. 
+I see the contribution from this work as specifying a model to estimate position effects in item response datasets where items can occur in multiple positions. The NWEA MAP assessment provides an empirical example the highlight both strengths and weaknesses of the approach.
